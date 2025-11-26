@@ -10,7 +10,9 @@ from vllm.logger import logger
 from vllm.sequence import IntermediateTensors
 from xlite._C import AttnMeta, AttnMHA, Model, ModelConfig, Runtime
 
-from vllm_ascend.attention.attention_v1 import AscendMetadata
+import vllm_ascend.envs as envs_ascend
+from vllm_ascend.attention.attention_v1 import (AscendAttentionState,
+                                                AscendMetadata)
 from vllm_ascend.utils import is_enable_nz
 
 
@@ -208,38 +210,45 @@ class XliteWrapper:
             return self.runnable(input_ids, positions, intermediate_tensors,
                                  inputs_embeds)
 
-        batch = attn_metadata.num_prefills + attn_metadata.num_decodes
-        seq_lens = attn_metadata.seq_lens[:batch]
-        query_lens = attn_metadata.query_lens[:batch]
-        cached_lens = seq_lens - query_lens
+        with_prefill = attn_metadata.attn_state not in [
+            AscendAttentionState.DecodeOnly, AscendAttentionState.SpecDecoding
+        ]
 
-        xlite_attn_metadata = AttnMeta()
-        xlite_attn_metadata.lens = query_lens.tolist()
-        xlite_attn_metadata.cached_lens = cached_lens.tolist()
-        xlite_attn_metadata.is_prefills = [
-            False
-        ] * attn_metadata.num_decodes + [True] * attn_metadata.num_prefills
-        xlite_attn_metadata.block_tables = attn_metadata.block_tables
-        xlite_attn_metadata.slot_mapping = attn_metadata.slot_mapping
-        xlite_attn_metadata.positions = positions
+        if not with_prefill or envs_ascend.VLLM_ASCEND_ENABLE_XLITE > 1:
+            batch = attn_metadata.num_prefills + attn_metadata.num_decodes
+            seq_lens = attn_metadata.seq_lens[:batch]
+            query_lens = attn_metadata.query_lens[:batch]
+            cached_lens = seq_lens - query_lens
 
-        hidden_states = torch.empty(attn_metadata.num_actual_tokens,
-                                    self.hidden_size,
-                                    device=input_ids.device,
-                                    dtype=self.dtype)
+            xlite_attn_metadata = AttnMeta()
+            xlite_attn_metadata.lens = query_lens.tolist()
+            xlite_attn_metadata.cached_lens = cached_lens.tolist()
+            xlite_attn_metadata.is_prefills = [
+                False
+            ] * attn_metadata.num_decodes + [True] * attn_metadata.num_prefills
+            xlite_attn_metadata.block_tables = attn_metadata.block_tables
+            xlite_attn_metadata.slot_mapping = attn_metadata.slot_mapping
+            xlite_attn_metadata.positions = positions
 
-        # xlite utilizes a self-managed stream for operator dispatch,
-        # and it is necessary to synchronize with the current stream
-        # of torch.npu here to ensure the validity of the NPU tensors
-        # in the prepare input process.
-        torch.npu.synchronize()
+            hidden_states = torch.empty(attn_metadata.num_actual_tokens,
+                                        self.hidden_size,
+                                        device=input_ids.device,
+                                        dtype=self.dtype)
+            # xlite utilizes a self-managed stream for operator dispatch,
+            # and it is necessary to synchronize with the current stream
+            # of torch.npu here to ensure the validity of the NPU tensors
+            # in the prepare input process.
+            torch.npu.synchronize()
 
-        if inputs_embeds is None:
-            self.xlite_model.forward(self.xlite_rt, input_ids,
-                                     xlite_attn_metadata, self.kv_caches,
-                                     self.freq_cis, hidden_states)
+            if inputs_embeds is None:
+                self.xlite_model.forward(self.xlite_rt, input_ids,
+                                         xlite_attn_metadata, self.kv_caches,
+                                         self.freq_cis, hidden_states)
+            else:
+                self.xlite_model.forward_with_inputs_embeds(
+                    self.xlite_rt, inputs_embeds, xlite_attn_metadata,
+                    self.kv_caches, self.freq_cis, hidden_states)
+            return hidden_states
         else:
-            self.xlite_model.forward_with_inputs_embeds(
-                self.xlite_rt, inputs_embeds, xlite_attn_metadata,
-                self.kv_caches, self.freq_cis, hidden_states)
-        return hidden_states
+            return self.runnable(input_ids, positions, intermediate_tensors,
+                                 inputs_embeds)
