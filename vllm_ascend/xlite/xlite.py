@@ -1,4 +1,4 @@
-from typing import Any, Callable, Dict, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -17,8 +17,8 @@ from vllm_ascend.utils import is_enable_nz
 class XliteModel:
 
     def initialize(
-            self, params_dict: Dict[str, torch.Tensor],
-            vllm_config: VllmConfig) -> Tuple[Model, int, int, torch.dtype]:
+            self, params_dict: Dict[str, torch.Tensor], vllm_config: VllmConfig
+    ) -> Tuple[Model, int, int, torch.dtype, int]:
         raise NotImplementedError(
             "Xlite Model initialize function not implemented.")
 
@@ -26,8 +26,8 @@ class XliteModel:
 class LlamaXliteModel(XliteModel):
 
     def initialize(
-            self, params_dict: Dict[str, torch.Tensor],
-            vllm_config: VllmConfig) -> Tuple[Model, int, int, torch.dtype]:
+            self, params_dict: Dict[str, torch.Tensor], vllm_config: VllmConfig
+    ) -> Tuple[Model, int, int, torch.dtype, int]:
         hf_config = vllm_config.model_config.hf_config
         config = ModelConfig()
         config.vocab_size = hf_config.vocab_size
@@ -116,11 +116,16 @@ class LlamaXliteModel(XliteModel):
         if xlite_model.embed is None:
             raise ValueError("xlite_model.embed is None, cannot get dtype!")
 
+        if xlite_model.head is None:
+            raise ValueError(
+                "xlite_model.head is None, cannot get lm head size!")
+
         freq_cis = self.precompute_freqs_cis(config.head_dim, max_seq_len,
-                                             xlite_model.embed.dtype)
+                                             xlite_model.embed.dtype,
+                                             hf_config.rope_theta)
 
         return (xlite_model, freq_cis, config.hidden_size,
-                xlite_model.embed.dtype)
+                xlite_model.embed.dtype, xlite_model.head.size(0))
 
     def precompute_freqs_cis(self,
                              dim: int,
@@ -139,7 +144,7 @@ class LlamaXliteModel(XliteModel):
 
 def xlite_model_init(
         params_dict: Dict[str, torch.Tensor],
-        vllm_config: VllmConfig) -> Tuple[Model, int, int, torch.dtype]:
+        vllm_config: VllmConfig) -> Tuple[Model, int, int, torch.dtype, int]:
     strategy_map = {
         "LlamaForCausalLM": LlamaXliteModel,
         "Qwen2ForCausalLM": LlamaXliteModel,
@@ -155,26 +160,26 @@ def xlite_model_init(
 
 class XliteWrapper:
     """
+    xlite graph wrapper
     """
 
     def __init__(self, runnable: nn.Module, vllm_config: VllmConfig):
-        #if isinstance(self.runnable, ACLGraphWrapper):
-        #    self.runnable = runnable.unwrap()
-        #else:
-        #    self.runnable = runnable
         self.runnable = runnable
 
+        self.tp_size = get_tensor_model_parallel_world_size()
         rank = torch.distributed.get_rank()
         local_rank = get_world_group().local_rank
         self.xlite_rt = Runtime(local_rank, 0, rank,
                                 get_tensor_model_parallel_world_size())
 
         params_dict = dict(self.runnable.named_parameters())
-        (self.xlite_model, self.freq_cis, self.hidden_size,
-         self.dtype) = xlite_model_init(params_dict, vllm_config)
+        (self.xlite_model, self.freq_cis, self.hidden_size, self.dtype,
+         self.lm_head_size_per_tp) = xlite_model_init(params_dict, vllm_config)
+        self.lm_head_size = self.lm_head_size_per_tp * self.tp_size
 
         rt_pool_size = self.xlite_model.get_tensor_pool_size()
-        logger.info(f"xlite runtime pool size: {rt_pool_size} MB")
+        if rank == 0:
+            logger.info(f"xlite runtime pool size: {rt_pool_size} MB")
         if self.xlite_rt.init_tensor_pool(rt_pool_size) != 0:
             raise ValueError(
                 f"xlite wrapper init failed! runtime pool size: {rt_pool_size} MB"
@@ -244,3 +249,18 @@ class XliteWrapper:
                 self.xlite_rt, inputs_embeds, xlite_attn_metadata,
                 self.kv_caches, self.freq_cis, hidden_states)
         return hidden_states
+
+    def compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        logits = torch.empty(self.tp_size,
+                             hidden_states.size(0),
+                             self.lm_head_size_per_tp,
+                             device=hidden_states.device,
+                             dtype=self.dtype)
+        torch.npu.synchronize()
+        self.xlite_model.compute_logits(self.xlite_rt, hidden_states, logits)
+        logits = logits.permute(1, 0, 2).reshape(hidden_states.size(0),
+                                                 self.lm_head_size)
+        return logits
