@@ -21,6 +21,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from typing import Any, TypeAlias, cast
+import traceback
 
 import torch
 import torch.nn as nn
@@ -582,7 +583,14 @@ class XliteWrapper:
         rank = torch.distributed.get_rank()
         local_rank = get_world_group().local_rank
         self.data_parallel_size = vllm_config.parallel_config.data_parallel_size
-        self.xlite_rt = Runtime(local_rank, 0, rank, get_tensor_model_parallel_world_size(), self.data_parallel_size)
+        try:
+            ep_word_size = get_ep_group().world_size
+            moe_ep_size = ep_word_size if vllm_config.parallel_config.enable_expert_parallel else 1
+            moe_tp_size = 1 if vllm_config.parallel_config.enable_expert_parallel else ep_word_size
+        except AssertionError:
+            moe_ep_size, moe_tp_size = 1, 1
+        self.xlite_rt = Runtime(local_rank, 0, rank, get_tensor_model_parallel_world_size(),
+                                self.data_parallel_size, moe_tp_size, moe_ep_size)
 
         self.adapter_xlite_model = get_adapter_xlite_model(runnable, vllm_config)
         (self.xlite_model, self.freq_cis, hidden_size, dtype) = self.adapter_xlite_model.initialize()
@@ -652,6 +660,19 @@ class XliteWrapper:
             XliteForwardResult: Forward outputs from xlite graph or the original runnable implementation.
         """
         forward_context = get_forward_context()
+        if forward_context.in_profile_run:
+            if self.full_mode:
+                # In full mode, the xlite runtime reserves all activation memory required by
+                # production-time forward passes up front via init_tensor_pool above. The pool
+                # size (get_tensor_pool_size) reflects the peak activation footprint of the
+                # xlite graph, so this allocation is already captured by the memory_profiling
+                # context wrapping profile_run. We therefore skip running the runnable/graph
+                # and return the pre-allocated hidden-state buffer, avoiding a redundant
+                # forward that would otherwise consume extra HBM.
+                return self.hidden_states
+            else:
+                return self.runnable(input_ids, positions, intermediate_tensors, inputs_embeds)
+
         attn_metadata: Any = forward_context.attn_metadata
         if attn_metadata is None:
             return self.runnable(input_ids, positions, intermediate_tensors, inputs_embeds)
