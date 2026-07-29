@@ -545,19 +545,10 @@ class DeepseekV3XliteModel(Glm4MoeXliteModel):
         self.init_matmul_weights(layers, "mla_qkv_a", "self_attn.fused_qkv_a_proj")
         self.init_matmul_weights(layers, "mla_q_b", "self_attn.q_b_proj")
         xlite_model.mla_q_norm = get_layer_weights(layers, "self_attn.q_a_layernorm.weight")
-        xlite_model.mla_kv_b = get_layer_weights(layers, "self_attn.kv_b_proj.weight")
         xlite_model.mla_kv_norm = get_layer_weights(layers, "self_attn.kv_a_layernorm.weight")
 
-        # kv_b_proj may be pruned (e.g., AscendSFAImpl) and need to be retrieved elsewhere and then reconstructed
-        if self.all_tensors_zero(xlite_model.mla_kv_b):
-            W_UV = get_layer_weights(layers, "self_attn.mla_attn.mla_attn.impl.W_UV")
-            W_UK_T = get_layer_weights(layers, "self_attn.mla_attn.mla_attn.impl.W_UK_T")
-            xlite_model.mla_kv_b = [
-                torch.cat([w_uk_t.permute(2, 0, 1), w_uv.transpose(0, 1)], dim=-1)
-                .view(self.xlite_config.kv_lora_rank, -1)
-                .T.contiguous()
-                for w_uk_t, w_uv in zip(W_UK_T, W_UV)
-            ]
+        xlite_model.mla_wuv = get_layer_weights(layers, "self_attn.mla_attn.mla_attn.impl.W_UV")
+        xlite_model.mla_wuk_t = get_layer_weights(layers, "self_attn.mla_attn.mla_attn.impl.W_UK_T")
 
         if not self.quantization:
             return
