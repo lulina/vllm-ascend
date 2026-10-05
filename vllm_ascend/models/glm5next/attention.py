@@ -121,10 +121,18 @@ class Glm5NextIndexerCache(DeepseekV32IndexerCache):
         from dataclasses import replace
 
         spec = super().get_kv_cache_spec(vllm_config)
-        # ``tokens_per_state`` is the KV-spec representation of kpool
-        # compression in the current cache-layout API.
         assert isinstance(spec, MLAAttentionSpec)
-        spec = replace(spec, tokens_per_state=self._index_kpool)
+        # NOTE: upstream GLM5 (commit 78f3a90f2) was written against vllm's
+        # KV-Cache Layout Refactor (#51718), which added a ``tokens_per_state``
+        # field consumed by the indexer metadata builder to emit pool-granular
+        # slot_mapping and to shrink the cache to one state per ``index_kpool``
+        # tokens. The vllm pin (ba07e4a48f, pre-refactor) has neither the field
+        # nor a consumer. Kpool compression *addressing* is handled inside the
+        # indexer op (kpool compress kernel); the spec only needs to publish
+        # the right physical block size, so we drop the ``tokens_per_state``
+        # replace and express the storage block via ``compress_ratio`` (whose
+        # ``storage_block_size = block_size // compress_ratio`` property is the
+        # pre-refactor equivalent).
 
         # DeepGEMM paged-MQA takes block_kv in {32, 64}; the storage block
         # (= block_size // index_kpool) is virtually split into pool pages of
@@ -145,9 +153,18 @@ class Glm5NextIndexerCache(DeepseekV32IndexerCache):
             page_size = max_page_size
         else:
             page_size = min_page_size
+        # ``storage_block_size`` is a read-only property on this vllm
+        # (``block_size // compress_ratio``); set ``compress_ratio`` so the
+        # property yields the desired ``page_size * index_kpool``.
+        target_storage_block_size = page_size * self._index_kpool
+        assert spec.block_size % target_storage_block_size == 0, (
+            "Glm5NextIndexerCache: block_size "
+            f"{spec.block_size} not divisible by target storage_block_size "
+            f"{target_storage_block_size}."
+        )
         return replace(
             spec,
-            storage_block_size=page_size * self._index_kpool,
+            compress_ratio=spec.block_size // target_storage_block_size,
         )
 
 
@@ -193,7 +210,9 @@ class Glm5NextTailCache(DeepseekV32IndexerCache):
         )
 
     def get_attn_backend(self):
-        from vllm.v1.attention.backends.mla.indexer import KpoolTailBackend
+        # KpoolTailBackend is vendored in vllm_ascend.models.glm5next because
+        # vllm ba07e4a48f predates #53906 (which added it upstream).
+        from vllm_ascend.models.glm5next.kpool_tail_backend import KpoolTailBackend
 
         return KpoolTailBackend
 
@@ -287,9 +306,11 @@ class Indexer(nn.Module):
         )
         self.max_model_len = vllm_config.model_config.max_model_len
         self.prefix = prefix
-        from vllm.v1.attention.backends.mla.indexer import get_max_prefill_buffer_size
-
-        self.max_total_seq_len = get_max_prefill_buffer_size(vllm_config)
+        # vllm ba07e4a48f predates #53906's get_max_prefill_buffer_size helper;
+        # inline its definition (max_model_len * 40 -- the magic number sizes
+        # the prefill buffer against flashmla_sparse's 5 * max_model_len
+        # workspace; 40 = (576 * 2 // 132) * 5).
+        self.max_total_seq_len = vllm_config.model_config.max_model_len * 40
         self.indexer_op = SparseAttnIndexerKpool(
             self.k_cache,
             self.quant_block_size,

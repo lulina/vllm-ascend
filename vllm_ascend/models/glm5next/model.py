@@ -64,6 +64,7 @@ from vllm.model_executor.models.interfaces import (
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
+    WeightsMapper,
     init_vllm_registered_model,
     is_pp_missing_parameter,
     make_layers,
@@ -913,12 +914,43 @@ class Glm5NextForConditionalGeneration(Glm4vForConditionalGeneration, HasInnerSt
     has_inner_state: ClassVar[Literal[True]] = True
     is_hybrid: ClassVar[Literal[True]] = True
 
-    # NOTE: weight-prefix mapping is inherited from Glm4vForConditionalGeneration
+    # Inherit the GLM-OCR / GLM-4V serialization prefix convention
     # (``model.visual.`` -> ``visual.``, ``model.language_model.`` ->
-    # ``language_model.model.``, ``lm_head.`` -> ``language_model.lm_head.``),
-    # matching the GLM-OCR / GLM-4V serialization convention. If the real
-    # checkpoint's safetensors keys differ (e.g. ``language_model.model.`` with
-    # no outer ``model.``), override ``hf_to_vllm_mapper`` accordingly.
+    # ``language_model.model.``, ``lm_head.`` -> ``language_model.lm_head.``)
+    # from Glm4vForConditionalGeneration, and additionally rewrite three
+    # checkpoint-vs-vLLM naming divergences:
+    #   1. MHC residual-stream infix: checkpoint ``attn_hc.<base|fn|scale>`` /
+    #      ``ffn_hc.<base|fn|scale>`` -> vLLM ``hc_attn_<base|fn|scale>`` /
+    #      ``hc_ffn_<base|fn|scale>``.
+    #   2. KDA linear-attention ``forget_gate.`` infix: the checkpoint nests
+    #      ``A_log`` / ``dt_bias`` / ``f_a_proj`` / ``f_b_proj`` under
+    #      ``self_attn.forget_gate.``, while the vLLM ``Glm5NextLinearAttention``
+    #      module holds them at the top level (``self.A_log`` etc., with
+    #      ``f_a_proj`` further folded into ``in_proj_qkvbfg_a`` shard 4 by
+    #      ``stacked_params_mapping``).
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "lm_head.": "language_model.lm_head.",
+            "model.language_model.": "language_model.model.",
+            "model.visual.": "visual.",
+        },
+        orig_to_new_substr={
+            ".attn_hc.": ".hc_attn_",
+            ".ffn_hc.": ".hc_ffn_",
+            ".forget_gate.": ".",
+        },
+    )
+
+    def load_weights(self, weights: Iterable[tuple[Any, ...]]) -> set[str]:
+        # GLM-5.3-Flash checkpoints ship a top-level learned ``rot.weight``
+        # (hidden_size x hidden_size rotation matrix) that is not consumed by
+        # the vLLM model -- the indexer query rotation is fused at runtime
+        # (see attention.py Hadamard-128 fusion) and no ``self.rot`` parameter
+        # is registered. Drop it before delegating to the GLM-4V
+        # AutoWeightsLoader path, mirroring tests/models/glm5_next.py which
+        # likewise skips ``rot.weight``.
+        weights = (args for args in weights if args[0] != "rot.weight")
+        return super().load_weights(weights)
 
     @classmethod
     def get_mamba_state_dtype_from_config(cls, vllm_config: VllmConfig):
