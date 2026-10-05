@@ -30,7 +30,16 @@ from vllm.distributed import get_ep_group, get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 from vllm.sequence import IntermediateTensors
-from xlite._C import AttnDSA, AttnMeta, AttnMHA, AttnMLA, Runtime, ScoringFuncSigmoid, ScoringFuncSoftmax
+from xlite._C import (
+    AttnDSA,
+    AttnGlm5,
+    AttnMeta,
+    AttnMHA,
+    AttnMLA,
+    Runtime,
+    ScoringFuncSigmoid,
+    ScoringFuncSoftmax,
+)
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
@@ -306,7 +315,13 @@ class StandardXliteModel(XliteModelBase):
             xlite_config.rope_theta = hf_config.rope_theta
         else:
             xlite_config.rope_theta = getattr(hf_config, "rope_parameters", {}).get("rope_theta", 10000.0)
-        xlite_config.softmax_scale = xlite_config.head_dim**-0.5
+        # MLA-style adapters (e.g. DeepSeek, GLM-5.3) set head_dim=0 as a
+        # sentinel ("use latent qk_nope/v dims instead") and overwrite
+        # softmax_scale in their own _build_model_config; guard the base
+        # placeholder so 0**-0.5 does not raise before that override runs.
+        xlite_config.softmax_scale = (
+            xlite_config.head_dim**-0.5 if xlite_config.head_dim else 0.0
+        )
         xlite_config.n_dense_layers = hf_config.num_hidden_layers
         xlite_config.intermediate_size = hf_config.intermediate_size
         xlite_config.def_tp_size = tp_size = get_tensor_model_parallel_world_size()
@@ -690,6 +705,212 @@ class MiniMaxM2XliteModel(StandardXliteModel):
         xlite_config.qk_norm_full = True
         xlite_config.scoring_func = ScoringFuncSigmoid
         xlite_config.gate_captured = False
+
+
+class Glm5NextXliteModel(DeepseekV32XliteModel):
+    """xlite adapter for GLM-5.3-Flash (glm5_next): hybrid KDA linear + NoPE sparse MLA + MHC + MoE.
+
+    Mirrors the weight binding of ``tests/models/glm5_next.py`` (GVirt/xlite reference), adapting
+    vLLM's ``Glm5Next*`` module layout (fused ``in_proj_qkvbfg_a``, per-layer KDA/MLA dispatch,
+    MHC residual streams) into the xlite C++ ``XModel`` slots.
+    """
+
+    _supported_architectures = ["Glm5NextForCausalLM", "Glm5NextForConditionalGeneration"]
+
+    def _build_model_config(self) -> None:
+        # Standard base sets vocab/hidden/layers/dims/tp/dp/block/max_seq/MoE defaults.
+        # The base's placeholder softmax_scale is guarded for head_dim=0 (GLM5
+        # MLA sentinel); we overwrite it below with the NoPE-correct value.
+        StandardXliteModel._build_model_config(self)
+        xlite_config, hf_config = self.xlite_config, self.hf_text_config
+
+        xlite_config.attn_type = AttnGlm5
+        # MLA latent (NoPE: rope_head_dim=0); head_dim unused by MLA.
+        xlite_config.n_kv_heads = 1
+        xlite_config.head_dim = 0
+        xlite_config.rope_head_dim = hf_config.qk_rope_head_dim  # 0 -> no rope
+        xlite_config.nope_head_dim = hf_config.qk_nope_head_dim
+        xlite_config.v_head_dim = hf_config.v_head_dim
+        xlite_config.q_lora_rank = hf_config.q_lora_rank
+        xlite_config.kv_lora_rank = hf_config.kv_lora_rank
+        # rope=0 so this reduces to qk_nope_head_dim**-0.5; mirrors the
+        # GVirt/xlite reference init_xlite_model softmax_scale assignment.
+        xlite_config.softmax_scale = (
+            hf_config.qk_nope_head_dim + hf_config.qk_rope_head_dim
+        ) ** -0.5
+
+        # MHC residual mixing. Glm5NextTextConfig folds the checkpoint's
+        # hc_mult / hc_sinkhorn_iters into the mhc_num_residual_streams /
+        # mhc_sinkhorn_iterations aliases.
+        xlite_config.hc_mult = hf_config.mhc_num_residual_streams
+        xlite_config.hc_sinkhorn_iters = hf_config.mhc_sinkhorn_iterations or 20
+        xlite_config.hc_eps = hf_config.hc_eps
+
+        # KDA linear-attention dims. Glm5NextTextConfig flattens the nested
+        # linear_attn_config dict (num_heads / head_dim / short_conv_kernel_size
+        # / gate_lower_bound) into top-level attributes.
+        xlite_config.linear_num_k_heads = hf_config.linear_num_heads
+        xlite_config.linear_num_v_heads = hf_config.linear_num_heads
+        xlite_config.linear_key_head_dim = hf_config.linear_head_dim
+        xlite_config.linear_value_head_dim = hf_config.linear_head_dim
+        xlite_config.linear_conv_kernel_dim = hf_config.linear_conv_kernel_dim
+        xlite_config.gate_lower_bound = hf_config.linear_lower_bound
+
+        # kpool indexer (sparse MLA layers).
+        xlite_config.index_head_dim = hf_config.index_head_dim
+        xlite_config.index_n_heads = hf_config.index_n_heads
+        xlite_config.index_topk = hf_config.index_topk
+        xlite_config.index_softmax_scale = hf_config.index_head_dim ** -0.5
+        xlite_config.index_kpool = hf_config.index_kpool
+        xlite_config.index_kpool_compress = hf_config.index_kpool_compress
+        xlite_config.index_kpool_always_select_tail = hf_config.index_kpool_always_select_tail
+        indexer_types = getattr(hf_config, "indexer_types", []) or []
+        xlite_config.index_full_mask = list(map(lambda x: str(x).lower().startswith("full"), indexer_types))
+
+        # Per-layer KDA-vs-MLA dispatch from layer_types ("linear_attention" ->
+        # KDA, else "deepseek_sparse_attention" -> MLA).
+        layer_types = getattr(hf_config, "layer_types", []) or []
+        xlite_config.kda_layers = [i for i, t in enumerate(layer_types) if t == "linear_attention"]
+        xlite_config.full_attn_layers = [i for i, t in enumerate(layer_types) if t != "linear_attention"]
+
+        # MoE.
+        xlite_config.n_dense_layers = getattr(hf_config, "first_k_dense_replace", 0)
+        xlite_config.n_routed_experts = hf_config.n_routed_experts
+        xlite_config.n_shared_experts = hf_config.n_shared_experts
+        xlite_config.n_act_experts = hf_config.num_experts_per_token
+        xlite_config.n_expert_groups = getattr(hf_config, "n_group", 1)
+        xlite_config.n_limited_groups = getattr(hf_config, "topk_group", 1)
+        xlite_config.moe_intermediate_size = hf_config.moe_intermediate_size
+        xlite_config.intermediate_size = hf_config.intermediate_size
+        xlite_config.norm_topk_prob = True
+        xlite_config.scoring_func = ScoringFuncSigmoid
+        xlite_config.route_scale = getattr(hf_config, "routed_scaling_factor", 1.0)
+        xlite_config.swiglu_limit = getattr(hf_config, "swiglu_limit", None)
+        xlite_config.gate_captured = False
+
+    def _build_model(self) -> None:
+        # NOTE: does NOT call super()._build_model() — GLM5 has no self_attn.qkv_proj (standard
+        # MHA path). All GLM5-specific slots (KDA fused split, MLA, indexer, MHC, MoE) bound here.
+        xlite_model, xlite_config = self.xlite_model, self.xlite_config
+        layers, model_prefix = self._get_layers_and_model_prefix()
+        hf_config = self.hf_text_config
+        n_layers = xlite_config.n_layers
+        tp_size = xlite_config.def_tp_size
+
+        # embed / norm / head
+        xlite_model.embed = get_dotted_attr(self.npu_runnable, f"{model_prefix}model.embed_tokens.weight", raises=True)
+        xlite_model.norm = get_dotted_attr(self.npu_runnable, f"{model_prefix}model.norm.weight", raises=True)
+        if getattr(hf_config, "tie_word_embeddings", False):
+            xlite_model.head = xlite_model.embed
+        else:
+            xlite_model.head = get_dotted_attr(self.npu_runnable, f"{model_prefix}lm_head.weight", raises=True)
+        xlite_model.attn_norm = get_layer_weights(layers, "input_layernorm.weight")
+        xlite_model.mlp_norm = get_layer_weights(layers, "post_attention_layernorm.weight")
+
+        # Per-layer KDA vs MLA masks.
+        kda_set = set(xlite_config.kda_layers)
+        kda_mask = [i in kda_set for i in range(n_layers)]
+        mla_mask = [not m for m in kda_mask]
+
+        # KDA fused in_proj_qkvbfg_a split: shards [q,k,v (proj each), b (num_heads), f_a,g_a (head_dim, replicated)].
+        proj = hf_config.linear_head_dim * hf_config.linear_num_heads
+        lp = proj // tp_size  # local projection (q/k/v per-rank)
+        lh = hf_config.linear_num_heads // tp_size  # local heads (b per-rank)
+        hd = hf_config.linear_head_dim
+        _slices = {
+            "glm5_q_proj": (0, lp), "glm5_k_proj": (lp, lp), "glm5_v_proj": (2 * lp, lp),
+            "glm5_b_proj": (3 * lp, lh),
+            "glm5_f_a_proj": (3 * lp + lh, hd), "glm5_g_a_proj": (3 * lp + lh + hd, hd),
+        }
+        for slot, (start, length) in _slices.items():
+            setattr(xlite_model, slot, get_layer_weights(
+                layers, "self_attn.in_proj_qkvbfg_a.weight", mask=kda_mask,
+                # The 2D row slice must no-op on the 1D _DUMMY_TENSOR that
+                # get_layer_weights substitutes for MLA (masked-out) layers.
+                post_processor=(lambda s, l: (lambda w: w[s:s + l, :].contiguous() if w.ndim >= 2 else w))(start, length)))
+
+        # KDA separate projections + conv1d + params.
+        self.init_matmul_weights(layers, "glm5_f_b_proj", "self_attn.f_b_proj", mask=kda_mask)
+        self.init_matmul_weights(layers, "glm5_g_b_proj", "self_attn.g_b_proj", mask=kda_mask)
+        self.init_matmul_weights(layers, "glm5_wo", "self_attn.o_proj", mask=kda_mask)
+        xlite_model.glm5_q_conv1d = get_layer_weights(layers, "self_attn.q_conv1d.weight", mask=kda_mask)
+        xlite_model.glm5_k_conv1d = get_layer_weights(layers, "self_attn.k_conv1d.weight", mask=kda_mask)
+        xlite_model.glm5_v_conv1d = get_layer_weights(layers, "self_attn.v_conv1d.weight", mask=kda_mask)
+        xlite_model.glm5_a_log = get_layer_weights(layers, "self_attn.A_log", mask=kda_mask)
+        xlite_model.glm5_dt_bias = get_layer_weights(layers, "self_attn.dt_bias", mask=kda_mask)
+        xlite_model.glm5_o_norm = get_layer_weights(layers, "self_attn.o_norm.weight", mask=kda_mask)
+
+        # MLA attention weights (full-attn layers).
+        self.init_matmul_weights(layers, "mla_qkv_a", "self_attn.fused_qkv_a_proj", mask=mla_mask)
+        self.init_matmul_weights(layers, "mla_q_b", "self_attn.q_b_proj", mask=mla_mask)
+        xlite_model.mla_q_norm = get_layer_weights(layers, "self_attn.q_a_layernorm.weight", mask=mla_mask)
+        xlite_model.mla_kv_norm = get_layer_weights(layers, "self_attn.kv_a_layernorm.weight", mask=mla_mask)
+        xlite_model.mla_wuv = get_layer_weights(layers, "self_attn.mla_attn.mla_attn.impl.W_UV", mask=mla_mask)
+        xlite_model.mla_wuk_t = get_layer_weights(layers, "self_attn.mla_attn.mla_attn.impl.W_UK_T", mask=mla_mask)
+        self.init_matmul_weights(layers, "attn_out", "self_attn.o_proj", mask=mla_mask)
+
+        # Indexer (MLA layers): the vLLM Indexer is a submodule at
+        # ``self_attn.indexer``; wk_weights_proj is fused [head_dim, n_head].
+        xlite_model.glm5_idx_wq_b = get_layer_weights(layers, "self_attn.indexer.wq_b.weight", mask=mla_mask)
+        idx_hd = hf_config.index_head_dim
+        xlite_model.glm5_idx_wk = get_layer_weights(
+            layers, "self_attn.indexer.wk_weights_proj.weight", mask=mla_mask,
+            post_processor=lambda w: w[:idx_hd, :].contiguous() if w.ndim >= 2 else w)
+        xlite_model.glm5_idx_weights_proj = get_layer_weights(
+            layers, "self_attn.indexer.wk_weights_proj.weight", mask=mla_mask,
+            post_processor=lambda w: w[idx_hd:, :].contiguous().t() if w.ndim >= 2 else w)
+        xlite_model.glm5_idx_k_norm = get_layer_weights(layers, "self_attn.indexer.k_norm.weight", mask=mla_mask)
+        xlite_model.glm5_idx_k_norm_bias = get_layer_weights(layers, "self_attn.indexer.k_norm.bias", mask=mla_mask)
+        xlite_model.glm5_idx_kpool_gate = get_layer_weights(layers, "self_attn.indexer.index_kpool_compress_gate", mask=mla_mask)
+        xlite_model.glm5_idx_kpool_ape = get_layer_weights(layers, "self_attn.indexer.index_kpool_compress_ape", mask=mla_mask)
+
+        # MHC residual mixing params (all base layers; fp32).
+        for slot in ("hc_attn_fn", "hc_attn_base", "hc_attn_scale", "hc_ffn_fn", "hc_ffn_base", "hc_ffn_scale"):
+            setattr(xlite_model, slot, get_layer_weights(
+                layers, slot, post_processor=lambda t: t.to(torch.float32)))
+
+        # MoE + dense MLP (reuse StandardXliteModel patterns).
+        mlp_prefix = self._decoder_layer_mlp_module
+        xlite_model.gate = get_layer_weights(layers, f"{mlp_prefix}.gate.weight")
+        xlite_model.gate_bias = get_layer_weights(
+            layers, f"{mlp_prefix}.gate.e_score_correction_bias",
+            post_processor=lambda b: b.to(torch.float32))
+        self.init_matmul_weights(layers, "se_up_gate", f"{mlp_prefix}.shared_experts.gate_up_proj")
+        self.init_matmul_weights(layers, "se_down", f"{mlp_prefix}.shared_experts.down_proj")
+        re_prefix = f"{mlp_prefix}.experts.routed_experts"
+        re_kwargs: WeightGetterConfig = {"secondary_flattening": f"{re_prefix}.local_num_experts"}
+        xlite_model.re_up_gate = get_layer_weights(layers, f"{re_prefix}.w13_weight", **re_kwargs)
+        xlite_model.re_down = get_layer_weights(layers, f"{re_prefix}.w2_weight", **re_kwargs)
+        self.init_matmul_weights(layers, "mlp_up_gate", f"{mlp_prefix}.gate_up_proj")
+        self.init_matmul_weights(layers, "mlp_down", f"{mlp_prefix}.down_proj")
+
+        if not self.quantization:
+            return
+        xlite_config.quant_attn_weight_nz = bool(xlite_model.glm5_q_proj) and self.is_tensor_nz(xlite_model.glm5_q_proj[0])
+        xlite_config.quant_attn_weight_transpose = True
+        xlite_config.experts_weight_nz = bool(xlite_model.re_up_gate) and self.is_tensor_nz(xlite_model.re_up_gate[0])
+        re_kwargs["post_processor"] = self._transform_deq_scale
+        xlite_model.re_up_gate_scale = get_layer_weights(layers, f"{re_prefix}.w13_weight_scale", **re_kwargs)
+        xlite_model.re_down_scale = get_layer_weights(layers, f"{re_prefix}.w2_weight_scale", **re_kwargs)
+
+    def _precompute_freqs_cis(self) -> torch.Tensor:
+        # GLM-5.3-Flash is NoPE (qk_rope_head_dim=0); return an empty placeholder. The xlite C++
+        # MLA path skips RoPE when rope_head_dim == 0, so the cache is never read.
+        return torch.empty(0, device="npu")
+
+    def extract_kv_cache(self, kv_caches: list[tuple[torch.Tensor, ...]], /) -> list[tuple[torch.Tensor, ...]]:
+        # GLM5 hybrid: KDA layers carry 4 slots (convQ, convK, convV, ssm); MLA layers carry 3
+        # (kCache, peCache[empty], indexKCache). vLLM lays out per-layer cache tuples in layer
+        # order; dispatch by the kda/full_attn mask.
+        xlite_config = self.xlite_config
+        kda_set = set(xlite_config.kda_layers)
+        result: list[tuple[torch.Tensor, ...]] = []
+        idx = 0
+        for li in range(xlite_config.n_layers):
+            nslots = 4 if li in kda_set else 3
+            result.append(kv_caches[idx:idx + nslots])
+            idx += nslots
+        return result
 
 
 def get_adapter_xlite_model(npu_runner: "XliteModelRunner", vllm_config: VllmConfig) -> XliteModelBase:
