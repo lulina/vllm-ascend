@@ -850,6 +850,37 @@ class XliteWrapper:
         cum_query_lens = attn_metadata_router.cu_query_lens[-seq_lens.size(0) :]
         query_lens = torch.diff(cum_query_lens, prepend=seq_lens.new_zeros(1))
         cached_lens = torch.clamp(seq_lens - query_lens, min=0)
+        # In async spec-decode mode the upstream `seq_lens` is optimistic: it
+        # assumes every draft token from the previous step was accepted, so it
+        # still counts rejected speculative tokens. The native MLA backend
+        # subtracts the per-request reject count from `seq_lens` inside
+        # ``_forward_decode`` via a deferred ``pending_reject`` finalize, but
+        # xlite forwards through its own C++ path and bypasses that finalize.
+        # Using the uncorrected `seq_lens - query_lens` here would therefore
+        # over-count the cached KV by the number of rejected spec tokens and let
+        # attention read the stale (rejected) KV, diverging from the
+        # non-speculative output.
+        #
+        # `positions` is already rejection-corrected (derived from the
+        # rolled-back `num_computed_tokens`), and the first position of each
+        # request equals the true cached length (0 for a fresh prefill,
+        # `num_computed_tokens` for a decode). Cap `cached_lens` by this true
+        # value: it is a no-op when the optimistic value already matches (no
+        # rejections), and it corrects the over-count otherwise.
+        positions_1d = torch.as_tensor(positions, device="cpu").reshape(-1)
+        # Flat token offset where each request begins in `positions`. Request 0
+        # starts at offset 0; request i (i >= 1) starts where request i-1 ends,
+        # i.e. at `cum_query_lens[i-1]`. Reconstruct the full start array by
+        # prepending 0 to `cum_query_lens[:-1]` instead of indexing with
+        # `cum_query_lens` directly: `cum_query_lens` is `cu_query_lens[-N:]`,
+        # which drops the leading 0, so its element 0 is request 1's start, not
+        # request 0's. Prepending 0 keeps request 0 anchored at offset 0 and
+        # stays consistent with the `query_lens` diff above.
+        req_starts = torch.cat(
+            [cum_query_lens.new_zeros(1), cum_query_lens[:-1]]
+        ).clamp(max=positions_1d.numel() - 1)
+        req_first_positions = positions_1d[req_starts]
+        cached_lens = torch.minimum(cached_lens, req_first_positions.to(cached_lens.dtype))
         block_tables = attn_metadata_router.block_tables
         num_reqs = max(1, (block_tables[:, 0] != 0).sum().item())  # number of non-empty requests
 
