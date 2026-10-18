@@ -367,6 +367,11 @@ class StandardXliteModel(XliteModelBase):
             xlite_config.moe_ep_size, xlite_config.moe_tp_size = 1, 1
         xlite_config.experts_weight_transpose = True
 
+        # EPLB: propagate the redundant-expert count so the C++ side derives
+        # totalPhysicalExperts = n_routed_experts + num_redundant_experts. 0 ⟺ non-EPLB.
+        # vllm-ascend validates it against the loaded map, so any config that starts is reliable.
+        xlite_config.num_redundant_experts = get_ascend_config().eplb_config.num_redundant_experts
+
         xlite_config.attn_type = AttnMHA
         xlite_config.scoring_func = ScoringFuncSoftmax
         xlite_config.weight_nz = get_ascend_config().weight_nz_mode == 2
@@ -426,9 +431,31 @@ class StandardXliteModel(XliteModelBase):
 
         re_prefix = f"{mlp_prefix}.experts.routed_experts"
         re_kwargs: WeightGetterConfig = {"secondary_flattening": f"{re_prefix}.local_num_experts"}
-        xlite_model.re_up_gate = get_layer_weights(layers, f"{re_prefix}.w13_weight", **re_kwargs)
-        xlite_model.re_down = get_layer_weights(layers, f"{re_prefix}.w2_weight", **re_kwargs)
+        # Under dynamic_eplb, vllm-ascend replaces w13_weight/w2_weight with per-physical-expert
+        # *_weight_list clones. secondary_flattening slices either form into a per-expert
+        # vector<at::Tensor>; D2D rebalance updates list elements in-place via .copy_(), so the
+        # data_ptrs captured by C++ stay valid across rebalance.
+        eplb_dynamic = get_ascend_config().eplb_config.dynamic_eplb
+        re_up_gate_attr = f"{re_prefix}.w13_weight_list" if eplb_dynamic else f"{re_prefix}.w13_weight"
+        re_down_attr = f"{re_prefix}.w2_weight_list" if eplb_dynamic else f"{re_prefix}.w2_weight"
+        xlite_model.re_up_gate = get_layer_weights(layers, re_up_gate_attr, **re_kwargs)
+        xlite_model.re_down = get_layer_weights(layers, re_down_attr, **re_kwargs)
         xlite_config.experts_weight_nz = bool(xlite_model.re_up_gate) and self.is_tensor_nz(xlite_model.re_up_gate[0])
+
+        # Hand each MoE layer's log2phy (logical→physical slot map, [n_routed_experts] int32)
+        # to C++ for zero-capture; the C++ side scatters gate outputs from logical to physical
+        # space before Dispatch. log2phy lives on the AscendRoutedExperts (mlp.experts.routed_experts,
+        # i.e. re_prefix) — one level below the AscendMoERunner (mlp.experts) — and is updated
+        # in-place by .copy_() so captured ptrs stay valid. AscendMoERunner itself exposes no
+        # log2phy accessor: model-runner-v2 keeps get_log2phy_map solely on the routed-experts
+        # submodule, so resolve re_prefix (not mlp.experts) here.
+        moe_layers = layers[xlite_config.n_dense_layers:]
+        log2phy_buffers: list[torch.Tensor] = []
+        for layer in moe_layers:
+            routed_experts = get_dotted_attr(layer, re_prefix)
+            log2phy = routed_experts.get_log2phy_map() if routed_experts is not None else None
+            log2phy_buffers.append(log2phy if log2phy is not None else torch.empty(0))
+        xlite_model.log2phy = log2phy_buffers
 
         # bias terms
         with xlite_model.condition(lambda tensors: not self.all_tensors_zero(tensors)):
@@ -451,8 +478,15 @@ class StandardXliteModel(XliteModelBase):
         xlite_model.re_down_scale_bias = get_layer_weights(layers, f"{re_prefix}.w2_scale_bias", **re_kwargs)
 
         re_kwargs["post_processor"] = self._transform_deq_scale
-        xlite_model.re_up_gate_scale = get_layer_weights(layers, f"{re_prefix}.w13_weight_scale", **re_kwargs)
-        xlite_model.re_down_scale = get_layer_weights(layers, f"{re_prefix}.w2_weight_scale", **re_kwargs)
+        # Under dynamic_eplb the scale tensors are also replaced with per-expert lists, with
+        # asymmetric names: w13 → w13_weight_scale_fp32_list (already fp32; the post_processor's
+        # .to(float32) is a no-op, byte-identical to Static's bfloat16 path),
+        # w2 → w2_weight_scale_list (same dtype as Static's w2_weight_scale).
+        re_up_scale_attr = (f"{re_prefix}.w13_weight_scale_fp32_list" if eplb_dynamic
+                            else f"{re_prefix}.w13_weight_scale")
+        re_down_scale_attr = f"{re_prefix}.w2_weight_scale_list" if eplb_dynamic else f"{re_prefix}.w2_weight_scale"
+        xlite_model.re_up_gate_scale = get_layer_weights(layers, re_up_scale_attr, **re_kwargs)
+        xlite_model.re_down_scale = get_layer_weights(layers, re_down_scale_attr, **re_kwargs)
 
     def init_matmul_weights(
         self,
