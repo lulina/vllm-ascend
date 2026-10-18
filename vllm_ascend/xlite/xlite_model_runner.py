@@ -137,6 +137,17 @@ class XliteModelRunner(XliteModelRunnerMixin, NPUModelRunner):  # type: ignore[m
         # NOTE: this will create a circular reference between XliteModelRunner and XliteWrapper instances,
         # but this should be fine since they are both long-lived objects
         self.model = self.runner_model = self.runner_cls(self, self.vllm_config, device=self.device)  # type: ignore[assignment]
+        # EAGLE3: super().load_model() configured aux hidden-state layers on the fallback
+        # model (it ran while self.model was still the fallback, before the wrapper was
+        # installed). Re-apply the same resolution to the wrapper so __call__ returns
+        # (h, [aux...]); the wrapper stores the tuple (sizing __call__'s aux buffers) and
+        # re-syncs the fallback for its overflow path. The xlite C++ model's
+        # aux_layer_ids is baked into xlite_config before init inside the wrapper ctor.
+        if getattr(self, "use_aux_hidden_state_outputs", False):
+            aux_layers = self._get_eagle3_aux_layers_from_config()
+            if not aux_layers:
+                aux_layers = self.model.get_eagle3_default_aux_hidden_state_layers()
+            self.model.set_aux_hidden_state_layers(aux_layers)
 
     def _dummy_run(
         self, *args: Any, is_profile: bool = False, is_graph_capturing: bool = False, **kwargs: Any
@@ -161,8 +172,12 @@ class XliteModelRunner(XliteModelRunnerMixin, NPUModelRunner):  # type: ignore[m
         logger.info_once("xlite: registering kv caches to runner model: %s", _TensorRepr(kv_caches, max_it=None))
         self.runner_model.register_kv_caches(kv_caches)
 
-        # check attention metadata backend compatibility
-        ascend_metadata_builder = self.attn_groups[0][-1].get_metadata_builder(0)
+        # Check attention metadata backend compatibility. Probe the first standard attention group
+        # (first kv-cache group's first attention group) — the same layer the xlite wrapper forwards
+        # (``model.layers.0.self_attn.attn``). ``[-1]`` would instead pick the last group, which for
+        # speculative methods like extract_hidden_states/dspark is the ``CacheOnlyAttentionLayer``
+        # group and triggers a false mismatch against the xlite-expected ``AscendMetadata``.
+        ascend_metadata_builder = self.attn_groups[0][0].get_metadata_builder(0)
         ascend_metadata_cls = getattr(ascend_metadata_builder, "metadata_cls", ascend_metadata_builder)
         xlite_expects = self.runner_model.adapter_xlite_model._attn_metadata_type
         if ascend_metadata_cls != xlite_expects and (
@@ -217,6 +232,17 @@ class XliteModelRunnerV2(XliteModelRunnerMixin, NPUModelRunnerV2):  # type: igno
         # NOTE: this will create a circular reference between XliteModelRunner and XliteWrapper instances,
         # but this should be fine since they are both long-lived objects
         self.model = self.runner_model = self.runner_cls(self, self.vllm_config, device=self.device)  # type: ignore[assignment]
+        # EAGLE3: super().load_model() configured aux hidden-state layers on the fallback
+        # model (it ran while self.model was still the fallback, before the wrapper was
+        # installed). Re-apply the same resolution to the wrapper so __call__ returns
+        # (h, [aux...]); the wrapper stores the tuple (sizing __call__'s aux buffers) and
+        # re-syncs the fallback for its overflow path. The xlite C++ model's
+        # aux_layer_ids is baked into xlite_config before init inside the wrapper ctor.
+        if getattr(self, "use_aux_hidden_state_outputs", False):
+            aux_layers = self._get_eagle3_aux_layers_from_config()
+            if not aux_layers:
+                aux_layers = self.model.get_eagle3_default_aux_hidden_state_layers()
+            self.model.set_aux_hidden_state_layers(aux_layers)
 
     def _dummy_run(self, *args: Any, is_profile: bool = False, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
         """Route dummy/profile runs to the native runnable, bypassing the xlite wrapper.
@@ -239,8 +265,12 @@ class XliteModelRunnerV2(XliteModelRunnerMixin, NPUModelRunnerV2):  # type: igno
         logger.info_once("xlite: registering kv caches to runner model: %s", _TensorRepr(kv_caches, max_it=None))
         self.runner_model.register_kv_caches(kv_caches)
 
-        # check attention metadata backend compatibility
-        ascend_metadata_builder = self.attn_groups[0][-1].get_metadata_builder(0)
+        # Check attention metadata backend compatibility. Probe the first standard attention group
+        # (first kv-cache group's first attention group) — the same layer the xlite wrapper forwards
+        # (``model.layers.0.self_attn.attn``). ``[-1]`` would instead pick the last group, which for
+        # speculative methods like extract_hidden_states/dspark is the ``CacheOnlyAttentionLayer``
+        # group and triggers a false mismatch against the xlite-expected ``AscendMetadata``.
+        ascend_metadata_builder = self.attn_groups[0][0].get_metadata_builder(0)
         ascend_metadata_cls = getattr(ascend_metadata_builder, "metadata_cls", ascend_metadata_builder)
         xlite_expects = self.runner_model.adapter_xlite_model._attn_metadata_type
         if ascend_metadata_cls != xlite_expects and (
