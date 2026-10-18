@@ -21,7 +21,7 @@ from __future__ import annotations
 import math
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any, TypeAlias, cast
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypeAlias, cast
 
 import regex as re
 import torch
@@ -140,6 +140,11 @@ class XliteModelBase(ABC):
         self.xlite_config = XModelConfig()
         self.xlite_model = XModel()
         self._build_model_config()
+        # EAGLE3: bake aux capture layer ids into the config before init. The native
+        # model copies ModelConfig at init, so aux_layer_ids must precede init (post-
+        # init updates to the Python ModelConfig object wouldn't propagate). This
+        # replaces the old post-init set_aux_layer_ids path.
+        self.xlite_config.aux_layer_ids = self._resolve_aux_layer_ids()
         self._build_model()
         self.xlite_model.init(self.xlite_config, torch.distributed.get_rank())
         self.rope_cossin_cache = self._precompute_rope_cache()
@@ -147,6 +152,23 @@ class XliteModelBase(ABC):
         if torch.distributed.get_rank() == 0:
             logger.info_once("xlite: built model config: %s", self.xlite_config)
             logger.info_once("xlite: built model weights: %s", self.xlite_model)
+
+    def _resolve_aux_layer_ids(self) -> list[int]:
+        """Resolve EAGLE3 aux capture layer ids (baked into config before :meth:`init`).
+
+        The native model copies ``ModelConfig`` at init, so ``aux_layer_ids`` is set on
+        the config here (before ``init``) rather than applied live post-init. Reads the
+        runner's EAGLE3 resolution; defaults to ``(2, n_layers // 2, n_layers - 3)`` when
+        unset, matching :meth:`XliteWrapper.get_eagle3_default_aux_hidden_state_layers`.
+        """
+        runner = self.npu_runner
+        if not getattr(runner, "use_aux_hidden_state_outputs", False):
+            return []
+        layers = runner._get_eagle3_aux_layers_from_config()
+        if not layers:
+            n_layers = self.xlite_config.n_layers
+            layers = (2, n_layers // 2, n_layers - 3)
+        return list(layers)
 
     def __del__(self) -> None:
         self.npu_runner = None  # type: ignore[assignment]
@@ -530,6 +552,14 @@ class StandardXliteModel(XliteModelBase):
         return super()._precompute_rope_cache().to(dtype=self.dtype, device=self.device)
 
     def extract_kv_cache(self, kv_caches: list[torch.Tensor], /) -> list[tuple[torch.Tensor, ...]]:
+        # EAGLE3 / extract_hidden_states interleaves CacheOnlyAttentionLayer bare hidden-state
+        # tensors (shape[-1] == hidden_size, set via extract_hidden_states.py head_size=hidden_size)
+        # into the flattened kv_caches. They aren't (k, v) caches and would desync the per-layer
+        # pairing below; the draft reads target hidden states through aux_outputs, so drop them by
+        # shape (head_dim != hidden_size for num_attention_heads > 1). MLA subclasses already filter
+        # by kv_lora_rank/rope_head_dim, so they need no change.
+        head_dim = self.xlite_config.head_dim
+        kv_caches = [cache for cache in kv_caches if cache.shape[-1] == head_dim]
         kv_caches = kv_caches[: 2 * self.xlite_config.n_layers]
         if wrong_dims := set(cache.shape[-1] for cache in kv_caches) - set([self.xlite_config.head_dim]):
             raise ValueError(f"xlite: kv_cache dimension mismatch (wrong dims: {', '.join(map(str, wrong_dims))})")
@@ -759,6 +789,21 @@ class XliteWrapper:
     back to the native runnable.
     """
 
+    supports_eagle3: ClassVar[Literal[True]] = True
+    """Marks this wrapper as implementing the EAGLE3 target interface (SupportsEagle3).
+    The xlite C++ model's aux_layer_ids is baked into ``xlite_config`` before init (see
+    :meth:`XliteModelBase._resolve_aux_layer_ids`), and the fallback runnable is synced
+    via :meth:`set_aux_hidden_state_layers`; ``__call__`` returns
+    ``(hidden_states, [aux...])`` when aux layers are set."""
+
+    # SupportsEagleBase members (has_own_lm_head / has_own_embed_tokens). These must be
+    # declared on the class: ``runtime_checkable`` isinstance uses ``getattr_static``,
+    # which bypasses ``__getattr__`` (the instance-level proxy to ``npu_runnable``), so
+    # the runnable providing them does not satisfy the check. False is correct — the
+    # wrapper has no trained lm_head / embed_tokens of its own (forwards to the runnable).
+    has_own_lm_head: ClassVar[bool] = False
+    has_own_embed_tokens: ClassVar[bool] = False
+
     def __init__(self, npu_runner: XliteModelRunner, vllm_config: VllmConfig, device: torch.device) -> None:
         """Initialize xlite runtime, model tensors, and hidden-state workspace.
 
@@ -796,6 +841,15 @@ class XliteWrapper:
         self.hidden_states = torch.empty(
             self.max_tokens, xlite_config.hidden_size, device=self.device, dtype=self.adapter_xlite_model.dtype
         )
+        # EAGLE3: aux capture layer ids (0-indexed global). Empty disables the aux path;
+        # set_aux_hidden_state_layers populates this tuple (sizing __call__'s aux buffers)
+        # and syncs the fallback runnable. The xlite C++ model's aux_layer_ids is baked
+        # into xlite_config before init (XliteModelBase._resolve_aux_layer_ids), so
+        # MaybeCaptureAuxHidden captures each listed layer's input raw (un-normalized)
+        # residual stream — before that layer's attention/FFN executes, aligned with
+        # vLLM ``aux_hidden_state_layers`` semantics — during the aux-capture overload
+        # of forward.
+        self.aux_hidden_state_layers: tuple[int, ...] = ()
 
         rt_pool_size = self.xlite_model.get_tensor_pool_size()
         if torch.distributed.get_rank() == 0:
@@ -825,6 +879,39 @@ class XliteWrapper:
             return getattr(self.npu_runnable, key)
         except Exception as e:  # runnable may raise various exceptions
             raise AttributeError(f"{self.__class__.__name__} object has no attribute {key}") from e
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        """Set which layers' input raw residual is captured for EAGLE3.
+
+        A layer id ``k`` captures the raw (un-normalized) residual stream entering layer
+        ``k`` (i.e. the output of layer ``k-1``), before layer ``k``'s attention/FFN
+        executes — aligned with vLLM ``aux_hidden_state_layers`` semantics. The Eagle3
+        draft applies its own RMSNorm in ``combine_hidden_states``, so the captured
+        states must be raw. ``k == n_layers`` captures the final residual (before the
+        last RMSNorm), matching vLLM's ``end_layer``.
+
+        Stores the layer tuple (sizes ``__call__``'s aux capture buffers) and syncs the
+        fallback runnable so the token-overflow path in ``__call__`` also produces aux
+        states. The xlite C++ model's ``aux_layer_ids`` is baked into ``xlite_config``
+        before ``init`` (see :meth:`XliteModelBase._resolve_aux_layer_ids`), so it is not
+        re-configured here. Called by the runner after load_model.
+
+        Args:
+            layers (tuple[int, ...]): 0-indexed global layer ids to capture.
+        """
+        self.aux_hidden_state_layers = tuple(layers)
+        # Keep the fallback runnable in sync for the overflow path in __call__.
+        if (fallback_setter := getattr(self.npu_runnable, "set_aux_hidden_state_layers", None)) is not None:
+            fallback_setter(layers)
+
+    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        """Default EAGLE3 aux layers: ``(2, n_layers // 2, n_layers - 3)``.
+
+        Matches :class:`vllm.model_executor.models.interfaces.SupportsEagle3`; n_layers is
+        read from the adapter's xlite_config (set from hf_config.num_hidden_layers).
+        """
+        n_layers = self.adapter_xlite_model.xlite_config.n_layers
+        return (2, n_layers // 2, n_layers - 3)
 
     def register_kv_caches(self, kv_caches: list[torch.Tensor]) -> None:
         """Register KV cache references used by xlite runtime.
@@ -929,8 +1016,26 @@ class XliteWrapper:
         h = self.hidden_states[:num_tokens]
         stream = torch.npu.current_stream().npu_stream
         input_ids = cast(torch.Tensor, input_ids)
+        # EAGLE3: when aux layers are set, capture intermediate-layer hidden states.
+        # The input_ids path uses the aux-capture overload of forward (v1 `forward` + aux_outputs); the
+        # inputs_embeds path has no C++ aux variant yet, so it falls back to the native
+        # runnable (which is SupportsEagle3 and returns the aux tuple itself).
+        use_aux = bool(self.aux_hidden_state_layers)
+        if use_aux and (inputs_embeds is not None and inputs_embeds.size(0) != 0):
+            return self.npu_runnable(input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs)
+        # Allocate aux capture buffers (empty list when aux disabled → no-op cost).
+        aux_buffers = [
+            torch.empty(
+                num_tokens, self.adapter_xlite_model.xlite_config.hidden_size,
+                device=self.device, dtype=self.adapter_xlite_model.dtype,
+            )
+            for _ in self.aux_hidden_state_layers
+        ]
         if inputs_embeds is None or inputs_embeds.size(0) == 0:
-            self.xlite_model.forward(
+            # EAGLE3: ``forward`` is overloaded — passing ``aux_outputs`` selects the
+            # aux-capture overload; omitting it selects the regular overload. ``aux_buffers``
+            # is empty (no capture, no overhead) when aux layers are not configured.
+            forward_kwargs = dict(
                 rt=self.xlite_rt,
                 input=input_ids[:num_actual_tokens],
                 attn_meta=xlite_attn_metadata,
@@ -939,6 +1044,9 @@ class XliteWrapper:
                 output=h,
                 curr_stream=stream,
             )
+            if use_aux:
+                forward_kwargs["aux_outputs"] = aux_buffers
+            self.xlite_model.forward(**forward_kwargs)
         else:
             inputs_embeds = inputs_embeds[:num_actual_tokens]
             deepstack_input_embeds = getattr(self.npu_runnable, "deepstack_input_embeds", [])
@@ -959,7 +1067,11 @@ class XliteWrapper:
                 _clear_stack := getattr(self.npu_runnable, "_clear_deepstack_input_embeds", None)
             ):
                 _clear_stack(inputs_embeds.size(0))
-        return h[:num_actual_tokens]
+        h_out = h[:num_actual_tokens]
+        if use_aux:
+            aux_out = [b[:num_actual_tokens] for b in aux_buffers]
+            return (h_out, aux_out)
+        return h_out
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | torch.nn.Module:
         # TODO: consider implementing a custom logits computation path for xlite to avoid falling back to the native
