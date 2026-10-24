@@ -537,13 +537,24 @@ class StandardXliteModel(XliteModelBase):
             setattr(xlite_model, xlite_attr, get_layer_weights(layers, layer_attr, mask=mask))
 
         wt_kwargs: WeightGetterConfig = {"mask": mask, "post_processor": self._transform_deq_scale}
-        deq_scale = get_layer_weights(layers, f"{model_prefix}.deq_scale", **wt_kwargs)
-        if len(deq_scale) > 0:  # static quant
-            setattr(xlite_model, f"{xlite_prefix}_deq_scale", deq_scale)
+        # Under mask mode, get_layer_weights substitutes the shared _DUMMY_TENSOR
+        # for layers whose attribute is missing, so ``len(deq_scale) > 0`` cannot
+        # tell a real per-channel deq_scale from placeholders and would misroute
+        # W8A8_DYNAMIC weights (no deq_scale) into the static-quant branch. The
+        # dummy is a single shared empty tensor; compare data_ptr on the
+        # *unprocessed* raw tensors (the post-processed deq_scale is a fresh
+        # tensor and is not identity-comparable to the dummy).
+        import vllm_ascend.xlite.utils as _xlite_utils
+        _dummy_ptr = _xlite_utils._DUMMY_TENSOR.data_ptr()
+        deq_scale_raw = get_layer_weights(layers, f"{model_prefix}.deq_scale", mask=mask)
+        is_static = any(t.numel() > 0 and t.data_ptr() != _dummy_ptr for t in deq_scale_raw)
+        if is_static:  # static quant
+            setattr(xlite_model, f"{xlite_prefix}_deq_scale",
+                    [self._transform_deq_scale(t) for t in deq_scale_raw])
             set_xlite_attr(f"{xlite_prefix}_input_scale", f"{model_prefix}.aclnn_input_scale_reciprocal")
             set_xlite_attr(f"{xlite_prefix}_input_offset", f"{model_prefix}.aclnn_input_offset")
             set_xlite_attr(f"{xlite_prefix}_quant_bias", f"{model_prefix}.quant_bias")
-        else:
+        else:  # dynamic quant: use per-channel weight_scale as deq_scale
             weight_scale = get_layer_weights(layers, f"{model_prefix}.weight_scale", **wt_kwargs)
             setattr(xlite_model, f"{xlite_prefix}_deq_scale", weight_scale)
 
