@@ -150,19 +150,78 @@ class XliteModelRunner(XliteModelRunnerMixin, NPUModelRunner):  # type: ignore[m
             self.model.set_aux_hidden_state_layers(aux_layers)
 
     def _dummy_run(
-        self, *args: Any, is_profile: bool = False, is_graph_capturing: bool = False, **kwargs: Any
+        self,
+        *args: Any,
+        is_profile: bool = False,
+        is_graph_capturing: bool = False,
+        with_prefill: bool = False,
+        **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Route dummy/profile runs to the native runnable, bypassing the xlite wrapper.
 
         See :meth:`_bypass_xlite_wrapper` for why dummy runs must not trigger the xlite forward. Delegates every
         argument to the base implementation unchanged.
+
+        Exception: in ``full_mode`` full-takeover (xlite preallocates the prefill-sized token budget, so serving
+        never falls back to the native runnable for batches within the scheduler cap) and no speculative
+        decoding is configured, the main profile run is a no-op rather than a native dummy forward. Serving
+        prefill intermediates live in the xlite C++ tensor pool (allocated via ``aclrtMalloc`` and already
+        counted under ``non_torch``), so the native dummy run would measure a fallback activation peak that is
+        never reached at serving time — a pure virtual reservation that shrinks the KV cache. Skipping it keeps
+        ``torch_peak_increase`` at the load_model baseline (verified: serving prefill adds no torch-side peak),
+        returning that HBM to the KV cache.
+
+        Three cases keep the native dummy forward even under full_mode (i.e. the no-op does not apply):
+        - ``with_prefill=True``: the MC2 capacity pre-run (``model_runner_v1.py`` profile_run) reserves the
+          native MC2/HCCL communication buffers used by the eager overflow path.
+        - ``is_graph_capturing``: full_mode forces ``enforce_eager``, so capture warmups keep the native path
+          consistent with the eager fallback used on overflow.
+        - ``speculative_config`` set (MTP/EAGLE3/DSpark/extract_hidden_states/...): the drafter runs on the
+          native runnable and EAGLE3's aux-capture path routes through ``npu_runnable`` when ``inputs_embeds``
+          is set (xlite.py), so the fallback activation peak must be profiled to reserve draft/aux memory.
+
+        The no-op returns the xlite wrapper's preallocated ``hidden_states`` (sized to ``max_m`` at load time)
+        so downstream ``dummy_compute_logits`` / sampler dummy runs see a correctly-shaped tensor without
+        allocating anything new.
         """
         if not is_profile and not is_graph_capturing:
             # DP `excute_dummy_batch` must be routed to xlite forward path to avoid out of sync issues
-            return super()._dummy_run(*args, is_profile=is_profile, is_graph_capturing=is_graph_capturing, **kwargs)  # type: ignore[return-value]
+            return super()._dummy_run(*args, is_profile=is_profile, is_graph_capturing=is_graph_capturing, with_prefill=with_prefill, **kwargs)  # type: ignore[return-value]
+
+        if is_profile and not with_prefill and not is_graph_capturing and self.runner_enabled:
+            xlite_cfg = get_ascend_config().xlite_graph_config
+            # Full-takeover guard: only when the xlite token budget equals the scheduler cap, i.e. every serving
+            # batch fits within `max_tokens` and never overflows to the native runnable. decode_only sizes the
+            # budget to a decode step, so prefill still runs on the native path and must profile there.
+            # Speculative decoding (MTP/EAGLE3/DSpark/extract_hidden_states/...) is also excluded: the drafter
+            # runs on the native runnable (its `dummy_run` is inside `super()._dummy_run`), and EAGLE3's aux
+            # path routes through `npu_runnable` when `inputs_embeds` is set (xlite.py), so serving still
+            # reaches the fallback and its activation peak must be profiled. The no-op would skip
+            # `drafter.dummy_run` and under-reserve draft/aux memory, risking serving-time OOM.
+            full_takeover = (
+                xlite_cfg.full_mode
+                and not self.speculative_config
+                and self.runner_model.max_tokens
+                >= self.vllm_config.scheduler_config.max_num_batched_tokens
+            )
+            if full_takeover:
+                torch.npu.reset_peak_memory_stats(self.device)
+                before = torch.npu.memory_allocated(self.device)
+                # Return the preallocated hidden_states buffer (zero-cost: allocated at load_model, already
+                # counted in the load baseline). profile_run expects (hidden_states, last_hidden_states); use
+                # the same buffer for both since downstream only inspects shape/dtype for dummy sampler/logits.
+                h = self.runner_model.hidden_states
+                logger.info_once(
+                    "xlite full_takeover: profile run skipped native dummy forward; torch peak %.2f MiB "
+                    "(before %.2f MiB, delta %.2f MiB) — fallback activation peak no longer reserved.",
+                    torch.npu.max_memory_allocated(self.device) / (1 << 20),
+                    before / (1 << 20),
+                    (torch.npu.max_memory_allocated(self.device) - before) / (1 << 20),
+                )
+                return h, h
 
         with self._bypass_xlite_wrapper():
-            return super()._dummy_run(*args, is_profile=is_profile, is_graph_capturing=is_graph_capturing, **kwargs)  # type: ignore[return-value]
+            return super()._dummy_run(*args, is_profile=is_profile, is_graph_capturing=is_graph_capturing, with_prefill=with_prefill, **kwargs)  # type: ignore[return-value]
 
     def initialize_kv_cache(
         self, kv_cache_config: KVCacheConfig, kv_cache_allocation_context: AbstractContextManager | None = None
